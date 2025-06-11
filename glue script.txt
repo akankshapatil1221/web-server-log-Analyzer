@@ -1,0 +1,58 @@
+import re
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from pyspark.sql import Row
+from pyspark.sql.functions import col, count, regexp_extract
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# S3 path to raw logs
+input_path = "s3://your-bucket/raw-logs/"
+output_path = "s3://your-bucket/structured-logs/"
+
+# Regex for Apache/Nginx combined log format
+log_pattern = r'^(\S+) - (\S+) \[(.*?)\] "(.*?)" (\d{3}) (\S+) "(.*?)" "(.*?)"$'
+
+# Load raw logs
+raw_df = spark.read.text(input_path)
+
+# Parse log lines into structured fields
+logs_df = raw_df.select(
+    regexp_extract('value', log_pattern, 1).alias('ip'),
+    regexp_extract('value', log_pattern, 2).alias('identd'),
+    regexp_extract('value', log_pattern, 3).alias('timestamp'),
+    regexp_extract('value', log_pattern, 4).alias('request'),
+    regexp_extract('value', log_pattern, 5).alias('status'),
+    regexp_extract('value', log_pattern, 6).alias('size'),
+    regexp_extract('value', log_pattern, 7).alias('referrer'),
+    regexp_extract('value', log_pattern, 8).alias('user_agent')
+)
+
+# Extract method, URL, protocol from request
+logs_df = logs_df.withColumn("method", regexp_extract("request", r'(\S+)\s', 1)) \
+                 .withColumn("url", regexp_extract("request", r'\s(\S+)\s', 1)) \
+                 .withColumn("protocol", regexp_extract("request", r'\s(\S+)$', 1))
+
+# Metrics: Top IPs
+top_ips = logs_df.groupBy("ip").count().orderBy("count", ascending=False)
+
+# Metrics: Most visited URLs
+top_urls = logs_df.groupBy("url").count().orderBy("count", ascending=False)
+
+# Metrics: Error rate
+total_requests = logs_df.count()
+error_requests = logs_df.filter(col("status").startswith("4") | col("status").startswith("5")).count()
+error_rate = error_requests / total_requests if total_requests else 0
+
+print(f"Total Requests: {total_requests}")
+print(f"Error Requests: {error_requests}")
+print(f"Error Rate: {error_rate:.2%}")
+
+# Output structured logs
+logs_df.write.mode("overwrite").json(output_path)
+
+# Optionally: write metrics to another path/table
+top_ips.write.mode("overwrite").json("s3://your-bucket/metrics/top-ips/")
+top_urls.write.mode("overwrite").json("s3://your-bucket/metrics/top-urls/")
